@@ -51,6 +51,20 @@ class TreatwellApp:
         data_dir = os.path.join(os.path.expanduser("~"), "Documents", "TreatwellData")
         os.makedirs(data_dir, exist_ok=True)
         return data_dir
+        
+    def format_appointment_time(self, datetime_str):
+        """Formatta la data e l'ora rimuovendo l'orario di fine appuntamento."""
+        try:
+        # Separa data e orario
+        if ", " in datetime_str:
+            date_part, time_part = datetime_str.split(", ")
+            # Prendi solo l'orario di inizio
+            start_time = time_part.split(" - ")[0]
+            return f"{date_part} alle ore {start_time}"
+        return datetime_str  # Restituisce l'originale se non segue il formato atteso
+    except Exception:
+        # In caso di formato non riconosciuto, restituisci l'originale
+        return datetime_str
 
     def load_saved_credentials(self):
         data_dir = self.ensure_data_dir()
@@ -382,101 +396,240 @@ class TreatwellApp:
             raise Exception("Invio fallito: " + str(e))
 
     def send_message(self):
-        if not self.selected_items:
-            messagebox.showinfo("Informazione", "Nessun cliente selezionato per l'invio del messaggio")
-            self.logger.info("Invio abortito: nessun cliente selezionato.")
+    if not self.selected_items:
+        messagebox.showinfo("Informazione", "Nessun cliente selezionato per l'invio del messaggio")
+        self.logger.info("Invio abortito: nessun cliente selezionato.")
+        return
+    message_template = self.message_text.get("1.0", "end").strip()
+    if not message_template:
+        messagebox.showwarning("Attenzione", "Il messaggio è vuoto")
+        self.logger.warning("Invio abortito: messaggio vuoto.")
+        return
+    wait_time = self.wait_time_var.get()
+    delay_time = self.delay_var.get()
+    confirm = messagebox.askyesno(
+        "Conferma Invio", 
+        f"Stai per inviare messaggi WhatsApp a {len(self.selected_items)} clienti.\n\n"
+        f"Messaggio: {message_template[:50]}{'...' if len(message_template)>50 else ''}\n\n"
+        "Assicurati di avere WhatsApp Web loggato.\n\nContinuo?"
+    )
+    if not confirm:
+        self.logger.info("Invio messaggi annullato dall'utente.")
+        return
+    self.init_whatsapp_driver()
+    progress_window = tb.Toplevel(self.root)
+    progress_window.title("Invio messaggi in corso")
+    progress_window.geometry("500x500")
+    progress_window.transient(self.root)
+    progress_window.grab_set()
+    tb.Label(progress_window, text="Invio messaggi WhatsApp in corso...", font=("Arial", 12)).pack(pady=(20,10))
+    progress_var = tb.DoubleVar(value=0)
+    progress_bar = tb.Progressbar(progress_window, length=450, variable=progress_var, mode='determinate', maximum=len(self.selected_items))
+    progress_bar.pack(pady=10, padx=20, fill="x")
+    status_var = tb.StringVar(value="Preparazione...")
+    status_label = tb.Label(progress_window, textvariable=status_var)
+    status_label.pack(pady=5)
+    log_frame = tb.Frame(progress_window)
+    log_frame.pack(fill="both", expand=True, padx=20, pady=10)
+    log_scroll = tb.Scrollbar(log_frame)
+    log_scroll.pack(side="right", fill="y")
+    log_text = tb.Text(log_frame, height=8, width=50, yscrollcommand=log_scroll.set)
+    log_text.pack(side="left", fill="both", expand=True)
+    log_scroll.config(command=log_text.yview)
+    self.cancel_sending = False
+    cancel_btn = tb.Button(progress_window, text="Annulla", command=lambda: setattr(self, 'cancel_sending', True))
+    cancel_btn.pack(pady=10)
+    
+    def log_message(msg):
+        timestamp = datetime.now().strftime('%H:%M:%S')
+        log_text.insert("end", f"{timestamp} - {msg}\n")
+        log_text.see("end")
+        progress_window.update_idletasks()
+        self.logger.info(msg)
+    
+    def retry_failed_messages():
+        if not failed_clients:
             return
-        message_template = self.message_text.get("1.0", "end").strip()
-        if not message_template:
-            messagebox.showwarning("Attenzione", "Il messaggio è vuoto")
-            self.logger.warning("Invio abortito: messaggio vuoto.")
-            return
-        wait_time = self.wait_time_var.get()
-        delay_time = self.delay_var.get()
-        confirm = messagebox.askyesno(
-            "Conferma Invio", 
-            f"Stai per inviare messaggi WhatsApp a {len(self.selected_items)} clienti.\n\n"
-            f"Messaggio: {message_template[:50]}{'...' if len(message_template)>50 else ''}\n\n"
-            "Assicurati di avere WhatsApp Web loggato.\n\nContinuo?"
+        
+        retry_confirm = messagebox.askyesno(
+            "Riprova invio", 
+            f"Vuoi riprovare l'invio a {len(failed_clients)} contatti che hanno generato errori?"
         )
-        if not confirm:
-            self.logger.info("Invio messaggi annullato dall'utente.")
+        if not retry_confirm:
             return
-        self.init_whatsapp_driver()
-        progress_window = tb.Toplevel(self.root)
-        progress_window.title("Invio messaggi in corso")
-        progress_window.geometry("500x500")
-        progress_window.transient(self.root)
-        progress_window.grab_set()
-        tb.Label(progress_window, text="Invio messaggi WhatsApp in corso...", font=("Arial", 12)).pack(pady=(20,10))
-        progress_var = tb.DoubleVar(value=0)
-        progress_bar = tb.Progressbar(progress_window, length=450, variable=progress_var, mode='determinate', maximum=len(self.selected_items))
-        progress_bar.pack(pady=10, padx=20, fill="x")
-        status_var = tb.StringVar(value="Preparazione...")
-        status_label = tb.Label(progress_window, textvariable=status_var)
-        status_label.pack(pady=5)
-        log_frame = tb.Frame(progress_window)
-        log_frame.pack(fill="both", expand=True, padx=20, pady=10)
-        log_scroll = tb.Scrollbar(log_frame)
-        log_scroll.pack(side="right", fill="y")
-        log_text = tb.Text(log_frame, height=8, width=50, yscrollcommand=log_scroll.set)
-        log_text.pack(side="left", fill="both", expand=True)
-        log_scroll.config(command=log_text.yview)
-        self.cancel_sending = False
-        cancel_btn = tb.Button(progress_window, text="Annulla", command=lambda: setattr(self, 'cancel_sending', True))
-        cancel_btn.pack(pady=10)
-        def log_message(msg):
+            
+        # Crea una nuova finestra di progresso per i tentativi di invio
+        retry_window = tb.Toplevel(self.root)
+        retry_window.title("Nuovo tentativo invio")
+        retry_window.geometry("500x500")
+        retry_window.transient(self.root)
+        retry_window.grab_set()
+        
+        tb.Label(retry_window, text="Nuovo tentativo invio messaggi...", font=("Arial", 12)).pack(pady=(20,10))
+        retry_progress_var = tb.DoubleVar(value=0)
+        retry_progress_bar = tb.Progressbar(retry_window, length=450, variable=retry_progress_var, 
+                                          mode='determinate', maximum=len(failed_clients))
+        retry_progress_bar.pack(pady=10, padx=20, fill="x")
+        
+        retry_status_var = tb.StringVar(value="Preparazione...")
+        retry_status_label = tb.Label(retry_window, textvariable=retry_status_var)
+        retry_status_label.pack(pady=5)
+        
+        retry_log_frame = tb.Frame(retry_window)
+        retry_log_frame.pack(fill="both", expand=True, padx=20, pady=10)
+        retry_log_scroll = tb.Scrollbar(retry_log_frame)
+        retry_log_scroll.pack(side="right", fill="y")
+        retry_log_text = tb.Text(retry_log_frame, height=8, width=50, yscrollcommand=retry_log_scroll.set)
+        retry_log_text.pack(side="left", fill="both", expand=True)
+        retry_log_scroll.config(command=retry_log_text.yview)
+        
+        self.cancel_retry = False
+        retry_cancel_btn = tb.Button(retry_window, text="Annulla", 
+                                   command=lambda: setattr(self, 'cancel_retry', True))
+        retry_cancel_btn.pack(pady=10)
+        
+        def retry_log_message(msg):
             timestamp = datetime.now().strftime('%H:%M:%S')
-            log_text.insert("end", f"{timestamp} - {msg}\n")
-            log_text.see("end")
-            progress_window.update_idletasks()
+            retry_log_text.insert("end", f"{timestamp} - {msg}\n")
+            retry_log_text.see("end")
+            retry_window.update_idletasks()
             self.logger.info(msg)
-        def send_messages_task():
-            sent_count = 0
-            error_count = 0
-            selected_clients = []
-            for item in self.selected_items:
-                values = self.client_tree.item(item, "values")
-                selected_clients.append({
-                    "name": values[1],
-                    "phone": values[2],
-                    "data_ora": values[3],
-                    "dipendente": values[5]
-                })
-            self.logger.debug("Inizio invio messaggi a %s clienti", len(selected_clients))
-            for i, client in enumerate(selected_clients):
-                if self.cancel_sending:
-                    log_message("Operazione annullata dall'utente.")
+        
+        def retry_task():
+            retry_success = 0
+            retry_error = 0
+            leftover_clients = []
+            
+            for i, client in enumerate(failed_clients):
+                if self.cancel_retry:
+                    retry_log_message("Operazione annullata dall'utente.")
                     break
+                
                 try:
-                    progress_var.set(i)
+                    retry_progress_var.set(i)
                     name = client["name"]
                     phone = self.format_phone_number(client["phone"])
-                    status_msg = f"Invio a {name} ({phone}) - {i+1}/{len(selected_clients)}"
-                    status_var.set(status_msg)
-                    log_message(f"Invio messaggio a {name} ({phone})")
+                    retry_status_msg = f"Invio a {name} ({phone}) - {i+1}/{len(failed_clients)}"
+                    retry_status_var.set(retry_status_msg)
+                    retry_log_message(f"Nuovo tentativo invio a {name} ({phone})")
+                    
                     if "{nome}" in message_template or "{dipendente}" in message_template or "{orario}" in message_template:
-                        personalized = message_template.replace("{nome}", client["name"]).replace("{dipendente}", client["dipendente"]).replace("{orario}", client["data_ora"])
+                        formatted_time = self.format_appointment_time(client["data_ora"])
+                        personalized = message_template.replace("{nome}", client["name"]) \
+                                                       .replace("{dipendente}", client["dipendente"]) \
+                                                       .replace("{orario}", formatted_time)
                     else:
-                        personalized = message_template + f"\n\nCliente: {client['name']}\nDipendente: {client['dipendente']}\nOrario: {client['data_ora']}"
+                        formatted_time = self.format_appointment_time(client["data_ora"])
+                        personalized = message_template + f"\n\nCliente: {client['name']}\nDipendente: {client['dipendente']}\nOrario: {formatted_time}"
+                    
                     self.send_whatsapp_message_selenium(phone, personalized, wait_time)
-                    sent_count += 1
-                    log_message(f"✓ Messaggio inviato a {name}")
+                    retry_success += 1
+                    retry_log_message(f"✓ Messaggio inviato a {name}")
                 except Exception as e:
-                    error_count += 1
-                    log_message(f"✗ Errore inviando a {client['name']}: {str(e)}")
-                if i < len(selected_clients)-1 and not self.cancel_sending:
+                    retry_error += 1
+                    leftover_clients.append(client)
+                    retry_log_message(f"✗ Errore inviando a {client['name']}: {str(e)}")
+                
+                if i < len(failed_clients)-1 and not self.cancel_retry:
                     time.sleep(delay_time)
-            if self.cancel_sending:
-                status_var.set(f"Interrotto: {sent_count} inviati, {error_count} errori.")
+            
+            if self.cancel_retry:
+                retry_status_var.set(f"Interrotto: {retry_success} inviati, {retry_error} errori.")
             else:
-                status_var.set(f"Completato: {sent_count} inviati, {error_count} errori.")
-            progress_var.set(len(selected_clients))
-            cancel_btn.config(text="Chiudi", command=progress_window.destroy)
-            self.update_status(f"Invio completato: {sent_count} successi, {error_count} errori")
-            self.logger.info("Invio messaggi completato: %s successi, %s errori", sent_count, error_count)
+                retry_status_var.set(f"Completato: {retry_success} inviati, {retry_error} errori.")
+            
+            retry_progress_var.set(len(failed_clients))
+            retry_cancel_btn.config(text="Chiudi", command=retry_window.destroy)
+            
+            # Se ci sono ancora errori, offri la possibilità di riprovare
+            if retry_error > 0 and not self.cancel_retry:
+                def offer_another_retry():
+                    nonlocal failed_clients
+                    failed_clients = leftover_clients.copy()
+                    retry_window.destroy()
+                    import threading
+                    threading.Thread(target=retry_task, daemon=True).start()
+                
+                retry_again_btn = tb.Button(retry_window, text=f"Riprova ancora con {retry_error} contatti", 
+                                          command=offer_another_retry)
+                retry_again_btn.pack(pady=5)
+        
         import threading
-        threading.Thread(target=send_messages_task, daemon=True).start()
+        threading.Thread(target=retry_task, daemon=True).start()
+    
+    def send_messages_task():
+        sent_count = 0
+        error_count = 0
+        nonlocal failed_clients
+        failed_clients = []
+        selected_clients = []
+        
+        for item in self.selected_items:
+            values = self.client_tree.item(item, "values")
+            selected_clients.append({
+                "name": values[1],
+                "phone": values[2],
+                "data_ora": values[3],
+                "dipendente": values[5]
+            })
+            
+        self.logger.debug("Inizio invio messaggi a %s clienti", len(selected_clients))
+        
+        for i, client in enumerate(selected_clients):
+            if self.cancel_sending:
+                log_message("Operazione annullata dall'utente.")
+                break
+                
+            try:
+                progress_var.set(i)
+                name = client["name"]
+                phone = self.format_phone_number(client["phone"])
+                status_msg = f"Invio a {name} ({phone}) - {i+1}/{len(selected_clients)}"
+                status_var.set(status_msg)
+                log_message(f"Invio messaggio a {name} ({phone})")
+                
+                if "{nome}" in message_template or "{dipendente}" in message_template or "{orario}" in message_template:
+                    formatted_time = self.format_appointment_time(client["data_ora"])
+                    personalized = message_template.replace("{nome}", client["name"]) \
+                                                   .replace("{dipendente}", client["dipendente"]) \
+                                                   .replace("{orario}", formatted_time)
+                else:
+                    formatted_time = self.format_appointment_time(client["data_ora"])
+                    personalized = message_template + f"\n\nCliente: {client['name']}\nDipendente: {client['dipendente']}\nOrario: {formatted_time}"
+                
+                self.send_whatsapp_message_selenium(phone, personalized, wait_time)
+                sent_count += 1
+                log_message(f"✓ Messaggio inviato a {name}")
+            except Exception as e:
+                error_count += 1
+                failed_clients.append(client)
+                log_message(f"✗ Errore inviando a {client['name']}: {str(e)}")
+                
+            if i < len(selected_clients)-1 and not self.cancel_sending:
+                time.sleep(delay_time)
+                
+        if self.cancel_sending:
+            status_var.set(f"Interrotto: {sent_count} inviati, {error_count} errori.")
+        else:
+            status_var.set(f"Completato: {sent_count} inviati, {error_count} errori.")
+            
+        progress_var.set(len(selected_clients))
+        
+        # Modifica il bottone Cancel per chiudere la finestra
+        cancel_btn.config(text="Chiudi", command=progress_window.destroy)
+        
+        # Se ci sono errori, aggiungi un bottone per riprovare
+        if error_count > 0 and not self.cancel_sending:
+            retry_btn = tb.Button(progress_window, text=f"Riprova con {error_count} contatti falliti", 
+                                command=retry_failed_messages)
+            retry_btn.pack(pady=5)
+            
+        self.update_status(f"Invio completato: {sent_count} successi, {error_count} errori")
+        self.logger.info("Invio messaggi completato: %s successi, %s errori", sent_count, error_count)
+    
+    failed_clients = []
+    import threading
+    threading.Thread(target=send_messages_task, daemon=True).start()
 
     def get_credentials(self):
         if not self.EMAIL or not self.PASSWORD:
