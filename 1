@@ -1,0 +1,658 @@
+#!/usr/bin/env python3
+import pickle, sys, time, os, pandas as pd, re, json, logging
+from datetime import datetime, timedelta
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from webdriver_manager.chrome import ChromeDriverManager
+from urllib.parse import quote
+import ttkbootstrap as tb  # for modern theming
+from tkinter import simpledialog, messagebox, filedialog  # use these for dialogs
+import win32gui, win32con  # type: ignore # for bringing Chrome to front
+
+def resource_path(relative_path):
+    base_path = getattr(sys, '_MEIPASS', os.path.abspath(os.path.dirname(__file__)))
+    return os.path.join(base_path, relative_path)
+
+class TreatwellApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("WA Reminder")
+        self.root.geometry("900x600")
+        self.EMAIL = ""
+        self.PASSWORD = ""
+        self.COOKIE_FILE = resource_path("cookies.pkl")
+        self.today_str = ""
+        self.APPT_URL = ""
+        self.df = None
+        self.whatsapp_driver = None
+        self.selected_items = set()
+        self.setup_logging()
+        self.setup_ui()
+        self.load_saved_credentials()
+
+    def setup_logging(self):
+        data_dir = self.ensure_data_dir()
+        log_path = os.path.join(data_dir, "treatwell_app.log")
+        self.logger = logging.getLogger("TreatwellApp")
+        self.logger.setLevel(logging.DEBUG)
+        if not self.logger.handlers:
+            fh = logging.FileHandler(log_path)
+            fh.setLevel(logging.DEBUG)
+            formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+            fh.setFormatter(formatter)
+            self.logger.addHandler(fh)
+        self.logger.debug("Logger initialized.")
+
+    def ensure_data_dir(self):
+        data_dir = os.path.join(os.path.expanduser("~"), "Documents", "TreatwellData")
+        os.makedirs(data_dir, exist_ok=True)
+        return data_dir
+
+    def load_saved_credentials(self):
+        data_dir = self.ensure_data_dir()
+        cred_file = os.path.join(data_dir, "credentials.json")
+        if os.path.exists(cred_file):
+            try:
+                with open(cred_file, "r") as f:
+                    data = json.load(f)
+                self.EMAIL = data.get("email", "")
+                self.PASSWORD = data.get("password", "")
+                self.logger.debug("Credenziali caricate.")
+            except Exception as e:
+                messagebox.showerror("Errore", "Impossibile caricare le credenziali: " + str(e))
+                self.logger.error("Errore caricando credenziali: %s", e)
+
+    def save_credentials(self):
+        data_dir = self.ensure_data_dir()
+        cred_file = os.path.join(data_dir, "credentials.json")
+        try:
+            with open(cred_file, "w") as f:
+                json.dump({"email": self.EMAIL, "password": self.PASSWORD}, f)
+            messagebox.showinfo("Info", "Credenziali salvate!")
+            self.logger.debug("Credenziali salvate correttamente.")
+        except Exception as e:
+            messagebox.showerror("Errore", "Impossibile salvare le credenziali: " + str(e))
+            self.logger.error("Errore salvando credenziali: %s", e)
+
+    def edit_credentials(self):
+        dialog = tb.Toplevel(self.root)
+        dialog.title("Modifica Credenziali")
+        tb.Label(dialog, text="Email:").grid(row=0, column=0, padx=10, pady=5, sticky="w")
+        email_entry = tb.Entry(dialog, width=30)
+        email_entry.grid(row=0, column=1, padx=10, pady=5)
+        email_entry.insert(0, self.EMAIL)
+        tb.Label(dialog, text="Password:").grid(row=1, column=0, padx=10, pady=5, sticky="w")
+        pass_entry = tb.Entry(dialog, width=30, show="*")
+        pass_entry.grid(row=1, column=1, padx=10, pady=5)
+        pass_entry.insert(0, self.PASSWORD)
+        def save_and_close():
+            self.EMAIL = email_entry.get().strip()
+            self.PASSWORD = pass_entry.get().strip()
+            self.save_credentials()
+            dialog.destroy()
+        tb.Button(dialog, text="Salva", command=save_and_close).grid(row=2, column=0, columnspan=2, pady=10)
+        dialog.grab_set()
+        dialog.wait_window()
+
+    def choose_date(self):
+        dialog = tb.Toplevel(self.root)
+        dialog.title("Seleziona Data")
+        tb.Label(dialog, text="Scegli un'opzione:").pack(pady=10, padx=10)
+        self.selected_date = None
+        def select_today():
+            self.selected_date = datetime.today().strftime("%Y-%m-%d")
+            dialog.destroy()
+        def select_tomorrow():
+            self.selected_date = (datetime.today() + timedelta(days=1)).strftime("%Y-%m-%d")
+            dialog.destroy()
+        def select_other():
+            date_str = simpledialog.askstring("Inserisci Data", "Inserisci la data (AAAA-MM-GG):", parent=dialog)
+            try:
+                datetime.strptime(date_str, "%Y-%m-%d")
+                self.selected_date = date_str
+            except Exception:
+                messagebox.showerror("Errore", "Formato data non valido. Usa AAAA-MM-GG.", parent=dialog)
+            dialog.destroy()
+        tb.Button(dialog, text="Oggi", command=select_today).pack(fill="x", padx=10, pady=5)
+        tb.Button(dialog, text="Domani", command=select_tomorrow).pack(fill="x", padx=10, pady=5)
+        tb.Button(dialog, text="Altra Data", command=select_other).pack(fill="x", padx=10, pady=5)
+        dialog.grab_set()
+        dialog.wait_window()
+        return self.selected_date
+
+    def setup_ui(self):
+        self.top_frame = tb.Frame(self.root)
+        self.top_frame.pack(fill="x", pady=10)
+        tb.Label(self.top_frame, text="WA Reminder", font=("Arial", 16)).pack(side="left", padx=10)
+        self.scrape_btn = tb.Button(self.top_frame, text="Recupera Appuntamenti", command=self.start_scraping)
+        self.scrape_btn.pack(side="right", padx=10)
+        self.load_csv_btn = tb.Button(self.top_frame, text="Carica CSV", command=self.load_csv)
+        self.load_csv_btn.pack(side="right", padx=10)
+        self.edit_creds_btn = tb.Button(self.top_frame, text="Modifica Credenziali", command=self.edit_credentials)
+        self.edit_creds_btn.pack(side="right", padx=10)
+        self.main_frame = tb.Frame(self.root)
+        self.main_frame.pack(fill="both", expand=True)
+        self.bottom_frame = tb.Frame(self.root)
+        self.bottom_frame.pack(fill="x", pady=10)
+        self.client_tree_frame = tb.Frame(self.main_frame)
+        self.client_tree_frame.pack(fill="both", expand=True, padx=5, pady=5)
+        self.tree_scroll_y = tb.Scrollbar(self.client_tree_frame)
+        self.tree_scroll_y.pack(side="right", fill="y")
+        self.tree_scroll_x = tb.Scrollbar(self.client_tree_frame, orient="horizontal")
+        self.tree_scroll_x.pack(side="bottom", fill="x")
+        self.client_tree = tb.Treeview(self.client_tree_frame, 
+                                        columns=("select", "name", "phone", "datetime", "service", "employee"), 
+                                        show="headings", 
+                                        yscrollcommand=self.tree_scroll_y.set,
+                                        xscrollcommand=self.tree_scroll_x.set)
+        self.tree_scroll_y.config(command=self.client_tree.yview)
+        self.tree_scroll_x.config(command=self.client_tree.xview)
+        self.client_tree.heading("select", text="Select")
+        self.client_tree.heading("name", text="Nome")
+        self.client_tree.heading("phone", text="Telefono")
+        self.client_tree.heading("datetime", text="Data e Ora")
+        self.client_tree.heading("service", text="Servizio")
+        self.client_tree.heading("employee", text="Dipendente")
+        self.client_tree.column("select", width=50, anchor="center")
+        self.client_tree.column("name", width=150)
+        self.client_tree.column("phone", width=120)
+        self.client_tree.column("datetime", width=150)
+        self.client_tree.column("service", width=200)
+        self.client_tree.column("employee", width=150)
+        self.client_tree.pack(fill="both", expand=True)
+        self.client_tree.bind("<Button-1>", self.toggle_selection)
+        tb.Label(self.bottom_frame, text="Messaggio da inviare:").pack(anchor="w", padx=5)
+        self.message_text = tb.Text(self.bottom_frame, height=4, width=70)
+        self.message_text.pack(fill="x", expand=True, pady=5, padx=5)
+        self.message_text.insert("end", "Ciao {nome}! Promemoria per l'appuntamento da Malasuerte con {dipendente} il {orario}: rispondi con un ok di conferma!")
+        self.whatsapp_frame = tb.Labelframe(self.bottom_frame, text="Impostazioni WhatsApp")
+        self.whatsapp_frame.pack(fill="x", pady=5, padx=5)
+        tb.Label(self.whatsapp_frame, text="Tempo di attesa (sec):").grid(row=0, column=0, padx=5, pady=5, sticky="w")
+        self.wait_time_var = tb.IntVar(value=15)
+        self.wait_time_spinbox = tb.Spinbox(self.whatsapp_frame, from_=5, to=30, textvariable=self.wait_time_var, width=5)
+        self.wait_time_spinbox.grid(row=0, column=1, padx=5, pady=5, sticky="w")
+        tb.Label(self.whatsapp_frame, text="Pausa tra messaggi (sec):").grid(row=0, column=2, padx=5, pady=5, sticky="w")
+        self.delay_var = tb.IntVar(value=2)
+        self.delay_spinbox = tb.Spinbox(self.whatsapp_frame, from_=1, to=10, textvariable=self.delay_var, width=5)
+        self.delay_spinbox.grid(row=0, column=3, padx=5, pady=5, sticky="w")
+        self.close_tab_var = tb.BooleanVar(value=True)
+        self.close_tab_check = tb.Checkbutton(self.whatsapp_frame, text="Chiudi scheda dopo invio", variable=self.close_tab_var)
+        self.close_tab_check.grid(row=0, column=4, padx=5, pady=5, sticky="w")
+        self.button_frame = tb.Frame(self.bottom_frame)
+        self.button_frame.pack(fill="x", pady=5)
+        self.select_all_btn = tb.Button(self.button_frame, text="Seleziona Tutti", command=self.select_all)
+        self.select_all_btn.pack(side="left", padx=5)
+        self.deselect_all_btn = tb.Button(self.button_frame, text="Deseleziona Tutti", command=self.deselect_all)
+        self.deselect_all_btn.pack(side="left", padx=5)
+        self.send_message_btn = tb.Button(self.button_frame, text="Invia Messaggio WhatsApp", command=self.send_message)
+        self.send_message_btn.pack(side="right", padx=5)
+        self.export_selected_btn = tb.Button(self.button_frame, text="Esporta Selezionati", command=self.export_selected)
+        self.export_selected_btn.pack(side="right", padx=5)
+        self.status_var = tb.StringVar()
+        self.status_var.set("Pronto per iniziare")
+        self.status_bar = tb.Label(self.root, textvariable=self.status_var, relief="sunken", anchor="w")
+        self.status_bar.pack(side="bottom", fill="x")
+
+    def update_status(self, message):
+        self.status_var.set(message)
+        self.root.update_idletasks()
+        self.logger.info("Status aggiornato: %s", message)
+
+    def toggle_selection(self, event):
+        region = self.client_tree.identify_region(event.x, event.y)
+        if region == "cell":
+            column = self.client_tree.identify_column(event.x)
+            if column == "#1":
+                item = self.client_tree.identify_row(event.y)
+                if item:
+                    if item in self.selected_items:
+                        self.selected_items.remove(item)
+                        self.client_tree.set(item, "select", "☐")
+                    else:
+                        self.selected_items.add(item)
+                        self.client_tree.set(item, "select", "☑")
+                    self.logger.debug("Toggle selection per item %s", item)
+
+    def select_all(self):
+        self.selected_items = set()
+        for item in self.client_tree.get_children():
+            self.selected_items.add(item)
+            self.client_tree.set(item, "select", "☑")
+        self.update_status(f"Selezionati tutti i {len(self.selected_items)} clienti")
+        self.logger.debug("Selezionati tutti i clienti.")
+
+    def deselect_all(self):
+        for item in self.client_tree.get_children():
+            self.client_tree.set(item, "select", "☐")
+        self.selected_items = set()
+        self.update_status("Deselezionati tutti i clienti")
+        self.logger.debug("Deselezionati tutti i clienti.")
+
+    def load_csv(self):
+        data_dir = self.ensure_data_dir()
+        filename = filedialog.askopenfilename(
+            title="Seleziona il file CSV",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            initialdir=data_dir
+        )
+        if filename:
+            try:
+                self.df = pd.read_csv(filename)
+                self.update_client_tree()
+                self.update_status(f"Caricati {len(self.df)} clienti da {os.path.basename(filename)}")
+                self.logger.debug("CSV caricato: %s clienti", len(self.df))
+            except Exception as e:
+                messagebox.showerror("Errore", f"Impossibile caricare il file: {str(e)}")
+                self.logger.error("Errore caricando CSV: %s", e)
+
+    def update_client_tree(self):
+        for item in self.client_tree.get_children():
+            self.client_tree.delete(item)
+        self.selected_items = set()
+        if self.df is not None:
+            for idx, row in self.df.iterrows():
+                self.client_tree.insert("", "end", values=(
+                    "☐",
+                    row.get("Nome", ""),
+                    row.get("Telefono", ""),
+                    row.get("Data e Ora", ""),
+                    row.get("Servizio", ""),
+                    row.get("Dipendente", "")
+                ))
+            self.logger.debug("Client tree aggiornato con %s elementi", len(self.df))
+
+    def export_selected(self):
+        if not self.selected_items:
+            messagebox.showinfo("Informazione", "Nessun cliente selezionato")
+            self.logger.info("Export abortito: nessun cliente selezionato.")
+            return
+        data_dir = self.ensure_data_dir()
+        filename = filedialog.asksaveasfilename(
+            title="Salva clienti selezionati",
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            initialfile=f"clienti_selezionati_{self.today_str}.csv",
+            initialdir=data_dir
+        )
+        if filename:
+            selected_data = []
+            for item in self.selected_items:
+                values = self.client_tree.item(item, "values")
+                selected_data.append({
+                    "Nome": values[1],
+                    "Telefono": values[2],
+                    "Data e Ora": values[3],
+                    "Servizio": values[4],
+                    "Dipendente": values[5]
+                })
+            selected_df = pd.DataFrame(selected_data)
+            selected_df.to_csv(filename, index=False)
+            self.update_status(f"Esportati {len(selected_data)} clienti in {os.path.basename(filename)}")
+            self.logger.debug("Esportati %s clienti in file %s", len(selected_data), filename)
+
+    def format_phone_number(self, phone):
+        digits_only = re.sub(r'\D', '', phone)
+        if not digits_only.startswith('+'):
+            if not digits_only.startswith('39'):
+                digits_only = '39' + digits_only
+            digits_only = '+' + digits_only
+        return digits_only
+
+    def init_whatsapp_driver(self):
+        if self.whatsapp_driver is None:
+            opts = webdriver.ChromeOptions()
+            profile_dir = os.path.join(os.path.expanduser("~"), "Documents", "WhatsAppProfile")
+            os.makedirs(profile_dir, exist_ok=True)
+            opts.add_argument(f"--user-data-dir={profile_dir}")
+            opts.add_argument("--profile-directory=Default")
+            self.whatsapp_driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opts)
+            self.whatsapp_driver.maximize_window()
+            self.whatsapp_driver.get("https://web.whatsapp.com")
+            WebDriverWait(self.whatsapp_driver, 60).until(
+                EC.presence_of_element_located((By.ID, "side"))
+            )
+            self.logger.debug("WhatsApp driver inizializzato.")
+
+    def ensure_whatsapp_driver(self):
+        if self.whatsapp_driver is None:
+            self.init_whatsapp_driver()
+        else:
+            try:
+                _ = self.whatsapp_driver.current_url
+            except Exception as e:
+                self.logger.warning("WhatsApp driver session invalid, reinitializing: %s", e)
+                try:
+                    self.whatsapp_driver.quit()
+                except Exception as qe:
+                    self.logger.error("Errore chiudendo driver invalido: %s", qe)
+                self.whatsapp_driver = None
+                self.init_whatsapp_driver()
+
+    def bring_chrome_to_front(self):
+        try:
+            title = self.whatsapp_driver.title
+            hwnd = win32gui.FindWindow(None, title)
+            if hwnd:
+                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                win32gui.SetForegroundWindow(hwnd)
+        except Exception as e:
+            self.logger.error("Errore nel portare Chrome in primo piano: %s", e)
+
+    def wait_for_chrome_focus(self, check_interval=0.5):
+        # Poll until Chrome reports focus
+        while not self.whatsapp_driver.execute_script("return document.hasFocus()"):
+            self.logger.debug("Waiting for Chrome to be in focus...")
+            time.sleep(check_interval)
+
+    def send_whatsapp_message_selenium(self, phone, message, wait_time):
+        self.ensure_whatsapp_driver()
+        encoded_message = quote(message)
+        url = f"https://web.whatsapp.com/send?phone={phone}&text={encoded_message}"
+        self.whatsapp_driver.get(url)
+        self.logger.debug("Navigated to WhatsApp URL for phone: %s", phone)
+        try:
+            self.whatsapp_driver.execute_script("window.focus();")
+            time.sleep(0.5) # force chrome to foreground
+            self.wait_for_chrome_focus()
+            send_btn_selector = "button[aria-label='Invia']"
+            self.logger.debug("Waiting for send button with wait time: %s", wait_time)
+            retries = 3
+            for attempt in range(retries):
+                try:
+                    send_btn = WebDriverWait(self.whatsapp_driver, wait_time).until(
+                        EC.element_to_be_clickable((By.CSS_SELECTOR, send_btn_selector))
+                    )
+                    self.logger.debug("Send button found; attempt %s", attempt+1)
+                    self.whatsapp_driver.execute_script("arguments[0].click();", send_btn)
+                    self.logger.debug("Clicked send button successfully for %s", phone)
+                    break
+                except Exception as e:
+                    if "stale element" in str(e).lower() and attempt < retries - 1:
+                        self.logger.warning("Stale element on attempt %s for %s, retrying...", attempt+1, phone)
+                        time.sleep(0.5)
+                        continue
+                    else:
+                        self.logger.error("Errore invio messaggio a %s: %s", phone, e)
+                        raise Exception("Invio fallito: " + str(e))
+        except Exception as e:
+            raise Exception("Invio fallito: " + str(e))
+
+    def send_message(self):
+        if not self.selected_items:
+            messagebox.showinfo("Informazione", "Nessun cliente selezionato per l'invio del messaggio")
+            self.logger.info("Invio abortito: nessun cliente selezionato.")
+            return
+        message_template = self.message_text.get("1.0", "end").strip()
+        if not message_template:
+            messagebox.showwarning("Attenzione", "Il messaggio è vuoto")
+            self.logger.warning("Invio abortito: messaggio vuoto.")
+            return
+        wait_time = self.wait_time_var.get()
+        delay_time = self.delay_var.get()
+        confirm = messagebox.askyesno(
+            "Conferma Invio", 
+            f"Stai per inviare messaggi WhatsApp a {len(self.selected_items)} clienti.\n\n"
+            f"Messaggio: {message_template[:50]}{'...' if len(message_template)>50 else ''}\n\n"
+            "Assicurati di avere WhatsApp Web loggato.\n\nContinuo?"
+        )
+        if not confirm:
+            self.logger.info("Invio messaggi annullato dall'utente.")
+            return
+        self.init_whatsapp_driver()
+        progress_window = tb.Toplevel(self.root)
+        progress_window.title("Invio messaggi in corso")
+        progress_window.geometry("500x500")
+        progress_window.transient(self.root)
+        progress_window.grab_set()
+        tb.Label(progress_window, text="Invio messaggi WhatsApp in corso...", font=("Arial", 12)).pack(pady=(20,10))
+        progress_var = tb.DoubleVar(value=0)
+        progress_bar = tb.Progressbar(progress_window, length=450, variable=progress_var, mode='determinate', maximum=len(self.selected_items))
+        progress_bar.pack(pady=10, padx=20, fill="x")
+        status_var = tb.StringVar(value="Preparazione...")
+        status_label = tb.Label(progress_window, textvariable=status_var)
+        status_label.pack(pady=5)
+        log_frame = tb.Frame(progress_window)
+        log_frame.pack(fill="both", expand=True, padx=20, pady=10)
+        log_scroll = tb.Scrollbar(log_frame)
+        log_scroll.pack(side="right", fill="y")
+        log_text = tb.Text(log_frame, height=8, width=50, yscrollcommand=log_scroll.set)
+        log_text.pack(side="left", fill="both", expand=True)
+        log_scroll.config(command=log_text.yview)
+        self.cancel_sending = False
+        cancel_btn = tb.Button(progress_window, text="Annulla", command=lambda: setattr(self, 'cancel_sending', True))
+        cancel_btn.pack(pady=10)
+        def log_message(msg):
+            timestamp = datetime.now().strftime('%H:%M:%S')
+            log_text.insert("end", f"{timestamp} - {msg}\n")
+            log_text.see("end")
+            progress_window.update_idletasks()
+            self.logger.info(msg)
+        def send_messages_task():
+            sent_count = 0
+            error_count = 0
+            selected_clients = []
+            for item in self.selected_items:
+                values = self.client_tree.item(item, "values")
+                selected_clients.append({
+                    "name": values[1],
+                    "phone": values[2],
+                    "data_ora": values[3],
+                    "dipendente": values[5]
+                })
+            self.logger.debug("Inizio invio messaggi a %s clienti", len(selected_clients))
+            for i, client in enumerate(selected_clients):
+                if self.cancel_sending:
+                    log_message("Operazione annullata dall'utente.")
+                    break
+                try:
+                    progress_var.set(i)
+                    name = client["name"]
+                    phone = self.format_phone_number(client["phone"])
+                    status_msg = f"Invio a {name} ({phone}) - {i+1}/{len(selected_clients)}"
+                    status_var.set(status_msg)
+                    log_message(f"Invio messaggio a {name} ({phone})")
+                    if "{nome}" in message_template or "{dipendente}" in message_template or "{orario}" in message_template:
+                        personalized = message_template.replace("{nome}", client["name"]).replace("{dipendente}", client["dipendente"]).replace("{orario}", client["data_ora"])
+                    else:
+                        personalized = message_template + f"\n\nCliente: {client['name']}\nDipendente: {client['dipendente']}\nOrario: {client['data_ora']}"
+                    self.send_whatsapp_message_selenium(phone, personalized, wait_time)
+                    sent_count += 1
+                    log_message(f"✓ Messaggio inviato a {name}")
+                except Exception as e:
+                    error_count += 1
+                    log_message(f"✗ Errore inviando a {client['name']}: {str(e)}")
+                if i < len(selected_clients)-1 and not self.cancel_sending:
+                    time.sleep(delay_time)
+            if self.cancel_sending:
+                status_var.set(f"Interrotto: {sent_count} inviati, {error_count} errori.")
+            else:
+                status_var.set(f"Completato: {sent_count} inviati, {error_count} errori.")
+            progress_var.set(len(selected_clients))
+            cancel_btn.config(text="Chiudi", command=progress_window.destroy)
+            self.update_status(f"Invio completato: {sent_count} successi, {error_count} errori")
+            self.logger.info("Invio messaggi completato: %s successi, %s errori", sent_count, error_count)
+        import threading
+        threading.Thread(target=send_messages_task, daemon=True).start()
+
+    def get_credentials(self):
+        if not self.EMAIL or not self.PASSWORD:
+            self.edit_credentials()
+        return bool(self.EMAIL and self.PASSWORD)
+
+    def start_scraping(self):
+        if not self.get_credentials():
+            self.update_status("Scraping annullato: credenziali mancanti")
+            return
+        chosen_date = self.choose_date()
+        if not chosen_date:
+            self.update_status("Scraping annullato")
+            return
+        self.today_str = chosen_date
+        self.APPT_URL = f"https://connect.treatwell.it/calendar#venue/430468/appointment/day/{self.today_str}/469665"
+        self.update_status("Inizializzazione scraping...")
+        self.logger.debug("Inizio scraping per data %s", self.today_str)
+        progress_window = tb.Toplevel(self.root)
+        progress_window.title("Scraping in corso")
+        progress_window.geometry("400x150")
+        progress_window.transient(self.root)
+        progress_window.grab_set()
+        tb.Label(progress_window, text="Inizializzazione browser...", font=("Arial", 10)).pack(pady=(20,10))
+        progress_bar = tb.Progressbar(progress_window, length=350, mode='indeterminate')
+        progress_bar.pack(pady=10, padx=20)
+        progress_bar.start(10)
+        log_text = tb.Text(progress_window, height=3, width=50, font=("Consolas", 8))
+        log_text.pack(pady=5, padx=20, fill="x")
+        def update_log(message):
+            log_text.insert("end", message+"\n")
+            log_text.see("end")
+            progress_window.update_idletasks()
+        # Scraping code remains unchanged
+        def init_driver(headless=True):
+            update_log("Inizializzazione browser Chrome...")
+            opts = webdriver.ChromeOptions()
+            if headless:
+                opts.add_argument("--headless")
+            opts.add_argument("--disable-blink-features=AutomationControlled")
+            opts.add_argument("--no-sandbox")
+            opts.add_argument("--disable-dev-shm-usage")
+            return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opts)
+        def login_and_save_cookies(driver):
+            update_log("Login manuale in corso...")
+            driver.get("https://connect.treatwell.it/login")
+            WebDriverWait(driver, 20).until(EC.element_to_be_clickable((By.NAME, "user"))).send_keys(self.EMAIL)
+            WebDriverWait(driver, 20).until(EC.element_to_be_clickable((By.NAME, "password"))).send_keys(self.PASSWORD)
+            WebDriverWait(driver, 20).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "[data-test='login-form-submit']"))).click()
+            WebDriverWait(driver, 20).until(lambda d: "dashboard" in d.current_url or "calendar" in d.current_url)
+            time.sleep(2)
+            pickle.dump(driver.get_cookies(), open(self.COOKIE_FILE, "wb"))
+            update_log("Cookies salvati.")
+        def load_cookies(driver):
+            update_log("Caricamento cookies...")
+            driver.get("https://connect.treatwell.it")
+            cookies = pickle.load(open(self.COOKIE_FILE, "rb"))
+            for cookie in cookies:
+                cookie.pop("sameSite", None)
+                driver.add_cookie(cookie)
+        def attempt_cookie_login(driver, attempts=2):
+            if os.path.exists(self.COOKIE_FILE):
+                for i in range(attempts):
+                    try:
+                        update_log("Tentativo login con cookies...")
+                        load_cookies(driver)
+                        driver.get(self.APPT_URL)
+                        WebDriverWait(driver, 20).until(lambda d: "calendar" in d.current_url.lower() or "dashboard" in d.current_url.lower())
+                        return True
+                    except Exception as e:
+                        update_log(f"Login con cookie fallito al tentativo {i+1}: {e}")
+                        time.sleep(3)
+                return False
+            return False
+        def extract_appointments(driver):
+            update_log("Estrazione appuntamenti...")
+            progress_bar.config(mode='determinate')
+            progress_bar["value"] = 0
+            driver.get(self.APPT_URL)
+            time.sleep(3)
+            current_count = len(driver.find_elements(By.CSS_SELECTOR, '.wc-cal-event'))
+            while True:
+                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                time.sleep(1)
+                new_count = len(driver.find_elements(By.CSS_SELECTOR, '.wc-cal-event'))
+                if new_count == current_count:
+                    break
+                current_count = new_count
+            update_log(f"Caricati {current_count} appuntamenti dopo scrolling.")
+            appointments = driver.find_elements(By.CSS_SELECTOR, ".wc-cal-event")
+            update_log(f"Trovati {len(appointments)} appuntamenti.")
+            data = []
+            actions = ActionChains(driver)
+            headers = driver.find_elements(By.CSS_SELECTOR, '[data-test="employee-calendar-header-name"]')
+            employee_columns = {}
+            for idx, header in enumerate(headers):
+                try:
+                    name = header.find_element(By.CSS_SELECTOR, ".name").text
+                    x = header.location['x']
+                    employee_columns[idx] = (x, name)
+                except Exception as e:
+                    update_log(f"Errore analisi intestazione: {e}")
+                    continue
+            for idx, appt in enumerate(appointments):
+                progress_bar['value'] = (idx+1)*100/len(appointments)
+                update_log(f"Estrazione {idx+1}/{len(appointments)} appuntamenti...")
+                progress_window.update_idletasks()
+                try:
+                    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", appt)
+                    time.sleep(0.5)
+                    try:
+                        actions.move_to_element(appt).perform()
+                    except Exception as e:
+                        update_log(f"Errore hover: {e}")
+                    time.sleep(0.5)
+                    try:
+                        tooltip = WebDriverWait(driver, 5).until(
+                            EC.visibility_of_element_located((By.CSS_SELECTOR, ".sal-event-info-wrapper[style*='display: block']"))
+                        )
+                    except Exception:
+                        driver.execute_script("var evObj = new MouseEvent('mouseover', {bubbles: true, cancelable: true, view: window}); arguments[0].dispatchEvent(evObj);", appt)
+                        tooltip = WebDriverWait(driver, 5).until(
+                            EC.visibility_of_element_located((By.CSS_SELECTOR, ".sal-event-info-wrapper[style*='display: block']"))
+                        )
+                    time.sleep(0.5)
+                    name = tooltip.find_element(By.CSS_SELECTOR, ".client").text
+                    phone = tooltip.find_element(By.CSS_SELECTOR, ".phone").text
+                    date_time = tooltip.find_element(By.CSS_SELECTOR, "td.date").text
+                    service = tooltip.find_element(By.CSS_SELECTOR, ".service-title").text
+                    appt_x = appt.location['x']
+                    emp_name, min_dist = None, float("inf")
+                    for x_val, header_name in employee_columns.values():
+                        dist = abs(appt_x - x_val)
+                        if dist < min_dist:
+                            min_dist = dist
+                            emp_name = header_name
+                    data.append([name, phone, date_time, service, emp_name])
+                except Exception as e:
+                    update_log(f"Errore analisi appuntamento: {e}")
+            self.df = pd.DataFrame(data, columns=["Nome", "Telefono", "Data e Ora", "Servizio", "Dipendente"])
+            data_dir = self.ensure_data_dir()
+            output_filename = os.path.join(data_dir, f"appuntamenti_{self.today_str}.csv")
+            self.df.to_csv(output_filename, index=False)
+            update_log(f"Salvato in {output_filename}")
+        def scraping_task():
+            driver = None
+            try:
+                driver = init_driver(headless=True)
+                if not attempt_cookie_login(driver):
+                    driver.quit()
+                    driver = init_driver(headless=False)
+                    login_and_save_cookies(driver)
+                    driver.quit()
+                    driver = init_driver(headless=True)
+                    load_cookies(driver)
+                extract_appointments(driver)
+                progress_bar.stop()
+                progress_bar.config(mode='determinate', value=100)
+                self.root.after(500, self.update_client_tree)
+                self.update_status(f"Scaricati {len(self.df)} appuntamenti")
+                update_log("Scraping completato!")
+                tb.Button(progress_window, text="Chiudi", command=progress_window.destroy).pack(pady=10)
+            except Exception as e:
+                update_log(f"Errore durante lo scraping: {str(e)}")
+                tb.Button(progress_window, text="Chiudi", command=progress_window.destroy).pack(pady=10)
+                self.update_status("Scraping fallito. Controlla i log.")
+            finally:
+                if driver:
+                    driver.quit()
+        import threading
+        threading.Thread(target=scraping_task, daemon=True).start()
+
+def main():
+    root = tb.Window(themename="flatly")  # try different themes if you like
+    app = TreatwellApp(root)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
